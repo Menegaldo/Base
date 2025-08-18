@@ -186,7 +186,7 @@ def parse_linha_log(linha):
         if dt_fim < dt_inicio:
             dt_fim += timedelta(days=1)
         duracao = dt_fim - dt_inicio
-        semana = dt_inicio.isocalendar()[:2]
+        semana = dt_inicio.isocalendar()[:2]  # (ano_iso, semana_iso) -> semana fecha domingo
         mes = dt_inicio.strftime("%Y-%m")
         return semana, mes, duracao
     except:
@@ -211,31 +211,44 @@ def _fmt_hhmm(td: timedelta) -> str:
     h = s // 3600; m = (s % 3600) // 60
     return f"{h}h{m:02d}m"
 
+def _fmt_hhmm_signed(td: timedelta, show_plus: bool = False) -> str:
+    s = int(td.total_seconds())
+    sign = ""
+    if s < 0:
+        sign = "-"
+        s = -s
+    elif show_plus:
+        sign = "+"
+    h = s // 3600; m = (s % 3600) // 60
+    return f"{sign}{h}h{m:02d}m"
+
 def _calc_banco_e_meta(semanais: dict):
+    # chave da semana atual (ISO: semana termina no DOMINGO)
     ano_atual, sem_atual, _ = datetime.now().isocalendar()
     chave_atual = (ano_atual, sem_atual)
 
+    # saldo acumulado ATÉ a semana anterior (pode ser negativo)
     banco_antes = timedelta(0)
-    for (ano, sem), t in semanais.items():
-        if (ano, sem) < chave_atual and t > META_SEMANAL:
+    for (ano, sem), t in sorted(semanais.items()):
+        if (ano, sem) < chave_atual:
             banco_antes += (t - META_SEMANAL)
 
     trab_atual = semanais.get(chave_atual, timedelta(0))
-    banco_usado = timedelta(0)
-    excedente_atual = timedelta(0)
+    delta_atual = trab_atual - META_SEMANAL  # diferença desta semana (pode ser neg.)
+    banco_depois = banco_antes + delta_atual
 
-    if trab_atual >= META_SEMANAL:
-        excedente_atual = trab_atual - META_SEMANAL
+    # quanto do banco positivo foi efetivamente usado para cobrir falta desta semana
+    banco_usado = timedelta(0)
+    if banco_antes > timedelta(0) and trab_atual < META_SEMANAL:
+        banco_usado = min(banco_antes, META_SEMANAL - trab_atual)
+
+    # horas que ainda faltam nesta semana para "zerar" meta considerando o saldo anterior
+    faltam = META_SEMANAL - trab_atual - banco_antes
+    if faltam < timedelta(0):
         faltam = timedelta(0)
-        banco_depois = banco_antes + excedente_atual
-    else:
-        faltam_bruto = META_SEMANAL - trab_atual
-        banco_usado = min(banco_antes, faltam_bruto)
-        faltam = faltam_bruto - banco_usado
-        banco_depois = banco_antes - banco_usado
 
     return (f"{ano_atual}-S{sem_atual:02d}",
-            trab_atual, faltam, banco_antes, banco_usado, banco_depois, excedente_atual)
+            trab_atual, faltam, banco_antes, banco_usado, banco_depois, delta_atual)
 
 # =================== ORDENAR / FORMATAR ===================
 
@@ -289,15 +302,11 @@ def ordenar_e_formatar_texto(texto_plain: str) -> str:
 # ===== Histórico sem descrição =====
 
 def _historico_sem_descricao(texto_plain: str) -> str:
-    """
-    Remove a descrição após '|', mantendo formato, linhas em branco e '----x----'.
-    """
     out = []
     for linha in texto_plain.splitlines():
         s = linha.rstrip("\n")
         if not s or s == "----x----":
-            out.append(s)
-            continue
+            out.append(s); continue
         if "|" in s:
             parte1, _ = s.split("|", 1)
             out.append(parte1.rstrip() + " | ")
@@ -305,34 +314,93 @@ def _historico_sem_descricao(texto_plain: str) -> str:
             out.append(s)
     return "\n".join(out) + ("\n" if out else "")
 
+# ===== Impressão alinhada =====
+
+def _print_kv_block(pairs, title):
+    # pairs: [(label, value), ...]  -> alinha valores em uma coluna única
+    pairs = [(k, v) for (k, v) in pairs if v is not None]
+    w = max((len(k) for k, _ in pairs), default=0)
+    linha = "-" * max(36, w + 12)
+    print("\n" + linha)
+    print(f"   {title}")
+    print(linha)
+    for k, v in pairs:
+        print(f"{k.ljust(w)}  {v}")
+
 # =================== EXIBIÇÃO ===================
 
 def exibir_totais(texto_plain: str):
     semanais, _ = calcular_totais(texto_plain)
 
+    # Total por Semana
+    labels = [f"{ano}-S{sem:02d}" for (ano, sem) in semanais.keys()]
+    w = max((len(s) for s in labels), default=0)
     print("\n=== Total por Semana ===")
     for (ano, semana), tempo in sorted(semanais.items()):
         horas = int(tempo.total_seconds() // 3600)
         minutos = int((tempo.total_seconds() % 3600) // 60)
-        print(f"{ano}-S{semana:02d}: {horas:02d}h{minutos:02d}m")
+        lbl = f"{ano}-S{semana:02d}"
+        print(f"{lbl.ljust(w)}  {horas:02d}h{minutos:02d}m")
 
-    sem_str, trab_atual, faltam, banco_antes, banco_usado, banco_depois, excedente_atual = _calc_banco_e_meta(semanais)
+    sem_str, trab_atual, faltam, banco_antes, banco_usado, banco_depois, delta_atual = _calc_banco_e_meta(semanais)
 
-    print("\n" + "-"*36)
-    print("   BANCO DE HORAS")
-    print("-"*36)
-    print(f"Acumulado (antes de abater):  {_fmt_hhmm(banco_antes)}")
-    if banco_usado > timedelta(0):
-        print(f"Utilizado em {sem_str}:          {_fmt_hhmm(banco_usado)}")
-    if excedente_atual > timedelta(0):
-        print(f"Excedente gerado em {sem_str}:  {_fmt_hhmm(excedente_atual)}")
-    print(f"Saldo (após abater):            {_fmt_hhmm(banco_depois)}")
+    # Banco de horas (com sinal)
+    pairs_banco = [
+        ("Saldo até semana anterior:",     _fmt_hhmm_signed(banco_antes, show_plus=True)),
+        ("Usado nesta semana:",            _fmt_hhmm(banco_usado) if banco_usado > timedelta(0) else None),
+        (f"Delta da semana {sem_str}:",    _fmt_hhmm_signed(delta_atual, show_plus=True)),
+        ("Saldo após esta semana:",        _fmt_hhmm_signed(banco_depois, show_plus=True)),
+    ]
+    _print_kv_block(pairs_banco, "BANCO DE HORAS")
 
-    print("\n" + "-"*36)
-    print(f"   META SEMANAL 40h [{sem_str}]")
-    print("-"*36)
-    print(f"Trabalhado na semana:           {_fmt_hhmm(trab_atual)}")
-    print(f"Faltam para 40h (após abater):  {_fmt_hhmm(faltam)}")
+    # Meta semanal
+    pairs_meta = [
+        ("Trabalhado na semana:",           _fmt_hhmm(trab_atual)),
+        ("Faltam p/ 40h (com saldo):",      _fmt_hhmm(faltam)),
+    ]
+    _print_kv_block(pairs_meta, f"META SEMANAL 40h [{sem_str}]")
+
+# ===== Fechamento automático de semana =====
+
+def _ultima_semana_no_texto(texto_plain: str):
+    ultima = None
+    for linha in texto_plain.splitlines():
+        semana, _, _ = parse_linha_log(linha)
+        if semana:
+            if (ultima is None) or (semana > ultima):
+                ultima = semana
+    return ultima  # tupla (ano, semana) ou None
+
+def _imprimir_fechamento_semana(sem_key, texto_plain: str):
+    semanais, _ = calcular_totais(texto_plain)
+    # saldo acumulado ANTES desta semana
+    banco_antes = timedelta(0)
+    for (ano, sem), t in sorted(semanais.items()):
+        if (ano, sem) < sem_key:
+            banco_antes += (t - META_SEMANAL)
+    trabalhado = semanais.get(sem_key, timedelta(0))
+    delta = trabalhado - META_SEMANAL
+    banco_depois = banco_antes + delta
+    sem_str = f"{sem_key[0]}-S{sem_key[1]:02d}"
+
+    pairs = [
+        ("Trabalhado na semana:",  _fmt_hhmm(trabalhado)),
+        ("Meta semanal:",          _fmt_hhmm(META_SEMANAL)),
+        ("Diferença (Δ):",         _fmt_hhmm_signed(delta, show_plus=True)),
+        ("Saldo anterior:",        _fmt_hhmm_signed(banco_antes, show_plus=True)),
+        ("Saldo após fechamento:", _fmt_hhmm_signed(banco_depois, show_plus=True)),
+    ]
+    _print_kv_block(pairs, f"FECHAMENTO DA SEMANA {sem_str}")
+
+def _fechar_semana_passada_se_necessario(texto_plain: str, data_nova_iso: str):
+    try:
+        dt_nova = datetime.strptime(data_nova_iso, "%Y-%m-%d")
+    except ValueError:
+        return
+    sem_nova = dt_nova.isocalendar()[:2]
+    sem_ultima = _ultima_semana_no_texto(texto_plain)
+    if sem_ultima and sem_ultima < sem_nova:
+        _imprimir_fechamento_semana(sem_ultima, texto_plain)
 
 # =================== OPERAÇÕES ===================
 
@@ -343,13 +411,17 @@ def registrar_entrada():
     data_final = normalizar_data(data_input)
     if not data_final: return
 
+    # fechamento automático se virou a semana
+    texto_atual = _carregar_texto(_PASS)
+    _fechar_semana_passada_se_necessario(texto_atual, data_final)
+
     hora_inicio = normalizar_hora(input("Hora de início (ex: 8.00 ou 08:30): "))
     if not hora_inicio: return
     hora_fim = normalizar_hora(input("Hora de término (ex: 12.00 ou 12:00): "))
     if not hora_fim: return
     atividade = input("Descreva a atividade realizada: ").strip()
 
-    texto = _carregar_texto(_PASS)
+    texto = texto_atual
     texto += f"[{data_final}] {hora_inicio} - {hora_fim} | {atividade}\n"
     texto = ordenar_e_formatar_texto(texto)
     _salvar_texto(_PASS, texto)
@@ -371,9 +443,6 @@ def mostrar_logs():
     exibir_totais(texto)
 
 def mostrar_logs_sem_descricao():
-    """
-    Mesma ordenação/formatos, mas esconde a descrição após '|'.
-    """
     global _PASS
     if not os.path.exists(ARQUIVO_LOG):
         print("❌ Nenhum registro encontrado.")
@@ -381,7 +450,7 @@ def mostrar_logs_sem_descricao():
         return
     texto = _carregar_texto(_PASS)
     texto = ordenar_e_formatar_texto(texto)
-    _salvar_texto(_PASS, texto)  # mantém arquivo organizado
+    _salvar_texto(_PASS, texto)
     print("\n=== Histórico de Atividades ===")
     print(_historico_sem_descricao(texto), end="")
     exibir_totais(texto)
@@ -391,26 +460,106 @@ def deletar_ultima_entrada():
     if not os.path.exists(ARQUIVO_LOG):
         print("❌ Nenhum registro para deletar."); return
     texto = _carregar_texto(_PASS)
-    linhas = [l for l in texto.splitlines() if l.strip() and l.strip() != "----x----"]
-    if not linhas:
+    linhas_validas = [l for l in texto.splitlines() if l.strip() and l.strip() != "----x----"]
+    if not linhas_validas:
         print("❌ Arquivo já está vazio."); return
-    ultima = linhas[-1]
+    ultima = linhas_validas[-1]
     print(f"⚠️ Remover última entrada: {ultima.strip()}?")
     if input("Digite 'sim' para confirmar: ").strip().lower() != "sim":
         print("❌ Cancelado."); return
-    todas = texto.splitlines()
-    removed = False; novas = []
-    for l in reversed(todas):
-        if not removed and l.strip() == ultima.strip():
-            removed = True; continue
-        novas.append(l)
-    novas.reverse()
-    texto_novo = "\n".join(novas) + ("\n" if novas else "")
+    todas = texto.splitlines(keepends=True)
+    # remove a última igual
+    for i in range(len(todas)-1, -1, -1):
+        if todas[i].strip() and todas[i].strip() != "----x----" and todas[i].strip() == ultima.strip():
+            del todas[i]; break
+    texto_novo = "".join(todas)
     texto_novo = ordenar_e_formatar_texto(texto_novo)
     _salvar_texto(_PASS, texto_novo)
     print("✅ Última entrada removida.")
 
-# ===== Atividade em andamento (arquivo temporário simples) =====
+def remover_entrada_por_indice():
+    """
+    Lista eventos numerados e remove o selecionado (qualquer um).
+    """
+    global _PASS
+    if not os.path.exists(ARQUIVO_LOG):
+        print("❌ Nenhum registro para deletar."); return
+
+    texto = _carregar_texto(_PASS)
+    texto = ordenar_e_formatar_texto(texto)
+    _salvar_texto(_PASS, texto)
+
+    linhas = texto.splitlines(keepends=True)
+    indices_validos = []
+    print("\n=== Eventos ===")
+    idx = 1
+    for i, l in enumerate(linhas):
+        s = l.strip()
+        if s and s != "----x----":
+            indices_validos.append(i)
+            print(f"{idx:3d}. {l.rstrip()}")
+            idx += 1
+    if not indices_validos:
+        print("❌ Nenhum evento encontrado."); return
+
+    try:
+        escolha = int(input("Número do evento para excluir (0 cancela): ").strip())
+    except ValueError:
+        print("❌ Entrada inválida."); return
+    if escolha == 0:
+        print("❌ Cancelado."); return
+    if not (1 <= escolha <= len(indices_validos)):
+        print("❌ Número fora do intervalo."); return
+
+    pos = indices_validos[escolha - 1]
+    alvo = linhas[pos].rstrip()
+    print(f"⚠️ Confirmar exclusão de: {alvo}")
+    if input("Digite 'sim' para confirmar: ").strip().lower() != "sim":
+        print("❌ Cancelado."); return
+
+    del linhas[pos]
+    texto_novo = "".join(linhas)
+    texto_novo = ordenar_e_formatar_texto(texto_novo)
+    _salvar_texto(_PASS, texto_novo)
+    print("✅ Entrada removida.")
+
+# =================== MENU ===================
+
+def menu():
+    while True:
+        print("\nEscolha uma opção:")
+        print("1. Iniciar atividade agora")
+        print("2. Finalizar atividade em andamento")
+        print("3. Registrar atividade manualmente")
+        print("4. Ver histórico e totais")
+        print("5. Ver histórico sem descrições")
+        print("6. Deletar última entrada")
+        print("7. Alterar senha (re-cifrar arquivo)")
+        print("8. Remover entrada por número")
+        print("0. Sair")
+        opcao = input("Opção: ").strip()
+        if opcao == "1":
+            iniciar_atividade()
+        elif opcao == "2":
+            finalizar_atividade()
+        elif opcao == "3":
+            registrar_entrada()
+        elif opcao == "4":
+            mostrar_logs()
+        elif opcao == "5":
+            mostrar_logs_sem_descricao()
+        elif opcao == "6":
+            deletar_ultima_entrada()
+        elif opcao == "7":
+            alterar_senha()
+        elif opcao == "8":
+            remover_entrada_por_indice()
+        elif opcao == "0":
+            print("Saindo..."); break
+        else:
+            print("❌ Opção inválida. Tente novamente.")
+
+# ===== Atividade em andamento =====
 
 def _ler_atividade_temp():
     if not os.path.exists(ARQUIVO_TEMP): return None
@@ -441,6 +590,11 @@ def finalizar_atividade():
     if not info:
         print("❌ Nenhuma atividade em andamento."); return
     data, hora_inicio, atividade = info
+
+    # fechamento automático se virou a semana
+    texto_atual = _carregar_texto(_PASS)
+    _fechar_semana_passada_se_necessario(texto_atual, data)
+
     fim_input = input("Hora de término (ex: 12.00 ou 12:00) [agora]: ").strip().lower()
     if fim_input in ("", "agora"):
         hora_fim = datetime.now().strftime("%H:%M")
@@ -448,46 +602,13 @@ def finalizar_atividade():
         hora_fim = normalizar_hora(fim_input)
         if not hora_fim: return
     hora_inicio = normalizar_hora(hora_inicio) or hora_inicio
-    texto = _carregar_texto(_PASS)
+    texto = texto_atual
     texto += f"[{data}] {hora_inicio} - {hora_fim} | {atividade}\n"
     texto = ordenar_e_formatar_texto(texto)
     _salvar_texto(_PASS, texto)
     os.remove(ARQUIVO_TEMP)
     print(f"⏹️ Finalizada e registrada: [{data}] {hora_inicio} - {hora_fim} | {atividade}")
     exibir_totais(texto)
-
-# =================== MENU ===================
-
-def menu():
-    while True:
-        print("\nEscolha uma opção:")
-        print("1. Iniciar atividade agora")
-        print("2. Finalizar atividade em andamento")
-        print("3. Registrar atividade manualmente")
-        print("4. Ver histórico e totais")
-        print("5. Ver histórico sem descrições")
-        print("6. Deletar última entrada")
-        print("7. Alterar senha (re-cifrar arquivo)")
-        print("0. Sair")
-        opcao = input("Opção: ").strip()
-        if opcao == "1":
-            iniciar_atividade()
-        elif opcao == "2":
-            finalizar_atividade()
-        elif opcao == "3":
-            registrar_entrada()
-        elif opcao == "4":
-            mostrar_logs()
-        elif opcao == "5":
-            mostrar_logs_sem_descricao()
-        elif opcao == "6":
-            deletar_ultima_entrada()
-        elif opcao == "7":
-            alterar_senha()
-        elif opcao == "0":
-            print("Saindo..."); break
-        else:
-            print("❌ Opção inválida. Tente novamente.")
 
 if __name__ == "__main__":
     _PASS = _requisitar_senha_inicial()
